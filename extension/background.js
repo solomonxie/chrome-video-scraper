@@ -2,7 +2,9 @@
 
 const HLS_RE = /\.m3u8?(\?|#|$)/i;
 const DASH_RE = /\.mpd(\?|#|$)/i;
-const SEGMENT_RE = /\.(ts|m4s|m4v\d|vtt|webvtt|key)(\?|#|$)/i;
+const SEGMENT_RE = /\.(ts|m4s|m4v\d|key)(\?|#|$)/i;
+const SUB_RE = /\.(vtt|webvtt|srt|ass|ssa|ttml|dfxp|lrc)(\?|#|$)|\/api\/timedtext\?/i;
+const SUB_CT = ['text/vtt', 'application/x-subrip', 'text/srt', 'application/ttml+xml', 'text/x-ssa'];
 const FILE_RE = /\.(mp4|webm|mkv|mov|m4v|flv|ogv|mp3|m4a|ogg|wav)(\?|#|$)/i;
 const SELF = `chrome-extension://${chrome.runtime.id}`;
 const MAX_ITEMS = 300;
@@ -28,6 +30,7 @@ function classify(url, contentType) {
   const ct = contentType.toLowerCase().split(';')[0].trim();
   if (HLS_RE.test(url) || ct.includes('mpegurl')) return 'hls';
   if (DASH_RE.test(url) || ct === 'application/dash+xml') return 'dash';
+  if (SUB_RE.test(url) || SUB_CT.includes(ct)) return 'sub';
   if (ct === 'video/mp2t' || ct === 'video/iso.segment' || SEGMENT_RE.test(url)) return null;
   if (FILE_RE.test(url) || ct.startsWith('video/') || ct.startsWith('audio/')) return 'file';
   return null;
@@ -42,7 +45,7 @@ function totalSize(headers) {
 function persist(tabId) {
   const items = tabs.get(tabId) || [];
   chrome.storage.session.set({ [`tab:${tabId}`]: items });
-  const count = items.filter((i) => i.kind !== 'file' || i.size >= BADGE_MIN_FILE_SIZE).length;
+  const count = items.filter((i) => i.kind !== 'sub' && (i.kind !== 'file' || i.size >= BADGE_MIN_FILE_SIZE)).length;
   chrome.action.setBadgeText({ tabId, text: count ? String(count) : '' }).catch(() => {});
   chrome.action.setBadgeBackgroundColor({ tabId, color: '#2563eb' }).catch(() => {});
 }
@@ -171,6 +174,27 @@ async function closeOffscreenIfIdle() {
   if (!busy) await chrome.offscreen.closeDocument().catch(() => {});
 }
 
+// --- Filenames -----------------------------------------------------------------
+// chrome.downloads.download({ filename }) is ignored whenever any other extension
+// (e.g. Google's "Office Editing") listens to onDeterminingFilename, and the file
+// comes out as "download" or the URL's last path part. Naming our downloads from
+// that same event avoids it. Every download goes through download() below.
+const pendingNames = new Map(); // url -> filename
+
+function download(url, filename) {
+  pendingNames.set(url, filename);
+  return chrome.downloads.download({ url, filename, saveAs: false, conflictAction: 'uniquify' })
+    .catch((e) => { pendingNames.delete(url); throw e; });
+}
+
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  const filename = pendingNames.get(item.url) ?? pendingNames.get(item.finalUrl);
+  if (item.byExtensionId !== chrome.runtime.id || !filename) return;
+  pendingNames.delete(item.url);
+  pendingNames.delete(item.finalUrl);
+  suggest({ filename, conflictAction: 'uniquify' });
+});
+
 chrome.downloads.onChanged.addListener(async (d) => {
   if (!d.state || d.state.current === 'in_progress') return;
   const key = `dl:${d.id}`;
@@ -197,8 +221,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return reply(updateJob(msg.job));
     case 'save':
       // The blob URL belongs to the offscreen document; it stays alive until we tell it to revoke.
-      return reply(chrome.downloads.download({ url: msg.url, filename: msg.filename, saveAs: false, conflictAction: 'uniquify' })
+      return reply(download(msg.url, msg.filename)
         .then((id) => chrome.storage.session.set({ [`dl:${id}`]: msg.url }).then(() => ({ id }))));
+    case 'download':
+      // From the popup: direct files and subtitles. Blob URLs it sends die with the popup,
+      // so it waits for this reply (the download has started) before letting go.
+      return reply(download(msg.url, msg.filename).then((id) => ({ id })));
     case 'idle':
       return reply(closeOffscreenIfIdle());
   }

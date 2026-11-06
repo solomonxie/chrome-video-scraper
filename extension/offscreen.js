@@ -138,35 +138,69 @@ class Job {
     }
   }
 
+  // A plain media file (mp4, webm…), fetched whole so subtitles can be muxed in.
+  async downloadFile(url, label) {
+    const { signal } = this.abort;
+    const t = this.track(label);
+    const res = await fetch(url, { credentials: 'include', signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    const size = Number(res.headers.get('content-length')) || 0;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let bytes = 0;
+    const started = performance.now();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      bytes += value.byteLength;
+      t.progress = size ? bytes / size : 0;
+      t.info = `${formatBytes(bytes)}${size ? ` / ${formatBytes(size)}` : ''} · ${formatBytes(bytes / ((performance.now() - started) / 1000))}/s`;
+      this.report();
+    }
+    t.progress = 1;
+    t.info += ' · done';
+    return { blob: new Blob(chunks), ext: this.job.fileExt || 'mp4' };
+  }
+
   async run() {
     const { job, state } = this;
     const base = sanitizeFilename(job.title);
-    const tasks = [this.downloadTrack(job.url, job.audioUrl ? 'Video' : 'Video + audio')];
-    if (job.audioUrl) tasks.push(this.downloadTrack(job.audioUrl, 'Audio'));
+    const subs = job.subtitles || [];
     state.message = 'Downloading…';
-    const [video, audio] = await Promise.all(tasks);
+    let video, audio;
+    if (job.fileUrl) {
+      video = await this.downloadFile(job.fileUrl, 'Video');
+    } else {
+      const tasks = [this.downloadTrack(job.url, job.audioUrl ? 'Video' : 'Video + audio')];
+      if (job.audioUrl) tasks.push(this.downloadTrack(job.audioUrl, 'Audio'));
+      [video, audio] = await Promise.all(tasks);
+      video.ext = video.fmp4 ? 'mp4' : 'ts';
+      if (audio) audio.ext = audio.fmp4 ? 'm4a' : 'ts';
+    }
 
-    const inputs = [{ blob: video.blob, ext: video.fmp4 ? 'mp4' : 'ts' }];
-    if (audio) inputs.push({ blob: audio.blob, ext: audio.fmp4 ? 'm4a' : 'ts' });
+    const inputs = [{ blob: video.blob, ext: video.ext }];
+    if (audio) inputs.push({ blob: audio.blob, ext: audio.ext });
     const total = inputs.reduce((n, i) => n + i.blob.size, 0);
+    const subNote = subs.length ? ` with ${subs.length} subtitle track${subs.length > 1 ? 's' : ''}` : '';
 
-    // Already a single fMP4 file: nothing to merge or convert.
-    if (!audio && video.fmp4) {
+    // Already a single MP4 file and no subtitles to add: nothing to merge or convert.
+    if (!audio && video.ext === 'mp4' && !subs.length) {
       await this.save(video.blob, `${base}.mp4`);
       return `Saved ${base}.mp4 (${formatBytes(video.blob.size)}) to Downloads.`;
     }
 
     let mergeError = '';
     if (total <= MAX_REMUX_BYTES) {
-      const t = this.track(audio ? 'Merging video + audio into .mp4' : 'Converting to .mp4');
+      const t = this.track(audio ? `Merging video + audio${subNote} into .mp4` : subs.length ? `Adding subtitles to .mp4` : 'Converting to .mp4');
       t.info = 'Loading ffmpeg…';
       state.message = 'Merging…';
       try {
-        const mp4 = await remuxToMp4(inputs, (p) => { t.progress = p; t.info = `${Math.round(p * 100)}%`; this.report(); }, this.abort.signal);
+        const mp4 = await remuxToMp4(inputs, (p) => { t.progress = p; t.info = `${Math.round(p * 100)}%`; this.report(); }, this.abort.signal, subs);
         t.progress = 1;
         t.info = 'done';
         await this.save(mp4, `${base}.mp4`);
-        return `Saved ${base}.mp4 (${formatBytes(mp4.size)}) to Downloads.`;
+        return `Saved ${base}.mp4${subNote} (${formatBytes(mp4.size)}) to Downloads.`;
       } catch (e) {
         if (this.abort.signal.aborted) throw e;
         mergeError = e.message || String(e);
@@ -176,14 +210,18 @@ class Job {
       mergeError = `${formatBytes(total)} is too large to merge in the browser (limit ${formatBytes(MAX_REMUX_BYTES)})`;
     }
 
-    // Fallback: save the raw tracks and show how to merge them locally.
-    const [vName, aName] = inputs.map((i, n) => `${base}${audio ? (n ? '.audio' : '.video') : ''}.${i.ext}`);
+    // Fallback: save the raw tracks (and subtitles as .srt) and show how to merge them locally.
+    const [vName, aName] = inputs.map((i, n) => `${base}${audio || subs.length ? (n ? '.audio' : '.video') : ''}.${i.ext}`);
     await this.save(video.blob, vName);
     if (audio) await this.save(audio.blob, aName);
-    state.command = audio
-      ? `cd ~/Downloads && ffmpeg -i "${vName}" -i "${aName}" -map 0:v -map 1:a -c copy "${base}.mp4"`
-      : `cd ~/Downloads && ffmpeg -i "${vName}" -c copy "${base}.mp4"`;
-    return `Saved ${audio ? `${vName} and ${aName}` : vName} to Downloads (couldn't make .mp4: ${mergeError}). Merge locally with:`;
+    const subNames = subs.map((sub, i) => `${base}.${sub.language || i + 1}.srt`);
+    for (const [i, sub] of subs.entries()) await this.save(new Blob([sub.srt], { type: 'application/x-subrip' }), subNames[i]);
+    const ins = [vName, ...(audio ? [aName] : []), ...subNames].map((n) => `-i "${n}"`).join(' ');
+    const maps = audio ? '-map 0:v -map 1:a' : subs.length ? '-map 0:v -map 0:a?' : '';
+    const subMaps = subs.map((sub, i) => ` -map ${inputs.length + i}:0${sub.language ? ` -metadata:s:s:${i} language=${sub.language}` : ''}`).join('');
+    state.command = `cd ~/Downloads && ffmpeg ${ins} ${maps}${subMaps} -c copy${subs.length ? ' -c:s mov_text' : ''} "${base}.mp4"`.replace(/  +/g, ' ');
+    const saved = [vName, ...(audio ? [aName] : []), ...subNames].join(', ');
+    return `Saved ${saved} to Downloads (couldn't make .mp4: ${mergeError}). Merge locally with:`;
   }
 }
 
